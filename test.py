@@ -40,6 +40,7 @@ def extract_availability_fields(item):
     同时兼容两种可能结构：
     1) 平铺在顶层：copiesOwned / copiesAvailable / numberOfHolds / availabilityType / estimatedWaitDays
     2) 嵌套在 item['availability'] 里
+    并补充 isAvailable, isHoldable, luckyDayAvailableCopies 字段
     """
     avail = item.get("availability", {}) or {}
 
@@ -52,6 +53,9 @@ def extract_availability_fields(item):
         "copiesAvailable": pick("copiesAvailable", 0) or 0,
         "numberOfHolds": pick("numberOfHolds", 0) or 0,
         "estimatedWaitDays": pick("estimatedWaitDays", None),
+        "isAvailable": item.get("isAvailable", avail.get("isAvailable", False)),
+        "isHoldable": item.get("isHoldable", avail.get("isHoldable", True)),
+        "luckyDayAvailableCopies": item.get("luckyDayAvailableCopies", avail.get("luckyDayAvailableCopies", 0)),
     }
     return fields
 
@@ -84,14 +88,18 @@ import math
 
 def get_book_availability(item):
     """
-    把一条 Libby 搜索记录合并为【有声书 / 电子书】两行。
-    去掉格式细节，只显示媒体类型 + 状态。
+    每行包含 Title, Author, Availability, MediaType, 等待情况
+    优化借阅状态判断，综合 isAvailable, isHoldable, luckyDayAvailableCopies
     """
     results = []
 
     # 书名
     raw_title = item.get("title", "未知书名")
     title = raw_title.get("main") if isinstance(raw_title, dict) else raw_title
+
+    # 作者
+    creators = item.get("creators") or []
+    author = ", ".join([c.get("name", "") for c in creators if isinstance(c, dict)])
 
     # 所有格式
     format_names = get_format_names(item)
@@ -112,48 +120,64 @@ def get_book_availability(item):
         if not formats:
             continue
 
-        # 计算等待时间
-        wait_weeks = compute_wait_weeks(
-            av["copiesOwned"], av["numberOfHolds"], av["estimatedWaitDays"]
-        )
-        if wait_weeks is None:
-            wait_text = "不可借"
-        elif wait_weeks == 0:
+        # 综合判断可借状态
+        if av["isAvailable"] or av["copiesAvailable"] > 0 or av["luckyDayAvailableCopies"] > 0:
             wait_text = "可立即借阅"
+            availability = "有"
+        elif not av["isHoldable"]:
+            wait_text = "不可借"
+            availability = "没有"
+        elif av["estimatedWaitDays"] is not None:
+            try:
+                wait_weeks = max(1, round(float(av["estimatedWaitDays"]) / 7))
+                wait_text = f"等待约 {wait_weeks} 周"
+                availability = "没有"
+            except Exception:
+                wait_text = "不可借"
+                availability = "没有"
         else:
-            wait_text = f"预计等待约 {wait_weeks} 周"
+            wait_text = "不可借"
+            availability = "没有"
 
-        # 每种媒体类型只生成一行
         results.append({
             "Title": title,
+            "Author": author,
+            "Availability": availability,
             "MediaType": media_type,
             "等待情况": wait_text
         })
 
     return results
 
+def preprocess_title(title):
+    """只保留括号 ( 或冒号 : 之前的部分"""
+    if not isinstance(title, str):
+        return ""
+    # 找到第一个 ( 或 : 的位置
+    idx1 = title.find('(')
+    idx2 = title.find(':')
+    idx = min(idx1 if idx1 != -1 else len(title), idx2 if idx2 != -1 else len(title))
+    return title[:idx].strip()
+
 def find_all_matches(items, title, author):
     """
-    在搜索结果中查找所有与目标书名或作者匹配的项。
-    返回所有可能相关的 item。
+    书名完全匹配，作者名包含即可
     """
-    title_norm = normalize(title)
+    title_norm = normalize(preprocess_title(title))
     author_norm = normalize(author)
     matches = []
 
     for item in items:
         raw_title = item.get("title", "")
         item_title = raw_title.get("main") if isinstance(raw_title, dict) else raw_title
+        item_title_norm = normalize(preprocess_title(item_title))
         creators = item.get("creators") or []
         item_authors = " ".join([c.get("name", "") for c in creators if isinstance(c, dict)])
-        title_match = title_norm in normalize(item_title)
-        author_match = author_norm in normalize(item_authors)
-
-        if title_match or author_match:
+        item_author_norm = normalize(item_authors)
+        # 书名完全匹配，作者名包含即可
+        if title_norm == item_title_norm and author_norm in item_author_norm:
             matches.append(item)
-
     return matches
-
 
 def debug_probe(title, author=None, limit=5):
     """
@@ -197,6 +221,7 @@ def debug_probe(title, author=None, limit=5):
         print("numberOfHolds:", av["numberOfHolds"])
         print("estimatedWaitDays:", av["estimatedWaitDays"])
 
+
 # ========== 主程序 ==========
 def search_books_in_libby(csv_path):
     # 读取 CSV 文件（Goodreads 导出是逗号分隔）
@@ -206,11 +231,14 @@ def search_books_in_libby(csv_path):
         print(f"❌ CSV 读取失败: {e}")
         return
 
-    # 检查是否有 Title 和 Author 列
-    if "Title" not in df.columns or "Author" not in df.columns:
-        print("❌ 错误：CSV 文件中缺少 Title 或 Author 列，请检查文件格式！")
+    # 检查是否有 Title、Author、Exclusive Shelf 列
+    if "Title" not in df.columns or "Author" not in df.columns or "Exclusive Shelf" not in df.columns:
+        print("❌ 错误：CSV 文件中缺少 Title、Author 或 Exclusive Shelf 列，请检查文件格式！")
         print(f"可用列：{df.columns.tolist()}")
         return
+
+    # 只处理 to-read
+    df = df[df["Exclusive Shelf"].str.strip().str.lower() == "to-read"]
 
     results = []
 
@@ -219,26 +247,38 @@ def search_books_in_libby(csv_path):
         author = str(row["Author"]).strip()
         print(f"\n🔍 开始查询: {title} by {author}")
 
-        items = search_libby_by_title(title)
+        items = search_libby_by_title(preprocess_title(title))
         matches = find_all_matches(items, title, author)
 
-        if matches:
-            for it in matches:
-                book_infos = get_book_availability(it)
-                results.extend(book_infos)
-                # 多行打印每个版本
-                for info in book_infos:
-                    print(
-                    f"✅ 找到: {info['Title']} | 类型: {info['MediaType']} | 状态: {info['等待情况']}"
-                )
-            
-            
+        # 按 title 分组，合并同一本书的不同媒体类型
+        media_map = {}
+        for it in matches:
+            raw_title = it.get("title", "")
+            item_title = raw_title.get("main") if isinstance(raw_title, dict) else raw_title
+            key = normalize(preprocess_title(item_title))
+            if key not in media_map:
+                media_map[key] = []
+            media_map[key].append(it)
+
+        if media_map:
+            for key, items_group in media_map.items():
+                for it in items_group:
+                    book_infos = get_book_availability(it)
+                    for info in book_infos:
+                        # 只保留 Title、Author、Availability、MediaType、等待情况
+                        results.append({
+                            "Title": f"{info['Title']} ({info['Author']})",
+                            "Availability": info["Availability"],
+                            "MediaType": info["MediaType"],
+                            "等待情况": info["等待情况"]
+                        })
+                        print(f"✅ 找到: {info['Title']} | 作者: {info['Author']} | 类型: {info['MediaType']} | 状态: {info['等待情况']}")
         else:
             results.append({
-                "Title": title,
+                "Title": f"{title}",
+                "Availability": "未找到",
                 "MediaType": "未找到",
-                "Formats": "",
-                "Availability": "未找到"
+                "等待情况": "未找到"
             })
             print(f"❌ 未找到: {title}")
 
@@ -252,9 +292,9 @@ def search_books_in_libby(csv_path):
 # ========== 执行 ==========
 if __name__ == "__main__":
     # 先做探针，验证字段是否拿到
-    #debug_probe("That's Not My Name", author="Megan Lally")
-    #debug_probe("When No One Is Watching", author="Alyssa Cole")
+    #debug_probe("Tell Me What You Did", author="Carter Wilson", limit=10)
+    #debug_probe("Welcome to the Hyunam-Dong Bookshop", author="Hwang Bo-Reum", limit=10)
 
     # 再跑你原来的批量流程
-    search_books_in_libby("goodreads_library_export.csv")
+    search_books_in_libby("goodreads_export.csv")
 
