@@ -286,13 +286,24 @@ def search_books_in_libby(csv_path):
                             availability_out = "Found"
                         else:
                             availability_out = availability
+                        # Convert WaitStatus for sorting: 'Available now' -> 0, 'Wait about X weeks' -> X, else blank
+                        wait_raw = info["WaitStatus"]
+                        if wait_raw == "Available now":
+                            wait_num = 0
+                        elif wait_raw.startswith("Wait about ") and wait_raw.endswith(" weeks"):
+                            try:
+                                wait_num = int(wait_raw.replace("Wait about ", "").replace(" weeks", "").strip())
+                            except Exception:
+                                wait_num = ""
+                        else:
+                            wait_num = ""
                         results.append({
                             "Title": f"{info['Title']} ({info['Author']})",
                             "Availability": availability_out,
                             "MediaType": info["MediaType"],
-                            "WaitStatus": info["WaitStatus"]
+                            "WaitStatus": wait_num
                         })
-                        print(f"✅ Found: {info['Title']} | Author: {info['Author']} | Type: {info['MediaType']} | Status: {info['WaitStatus']}")
+                        print(f"✅ Found: {info['Title']} | Author: {info['Author']} | Type: {info['MediaType']} | Status: {wait_num}")
         else:
             results.append({
                 "Title": f"{title_full}",
@@ -304,7 +315,9 @@ def search_books_in_libby(csv_path):
 
         time.sleep(1)  # Prevent rate limiting
 
+    # Change column name from 'WaitStatus' to 'WaitWeeks' for clarity
     result_df = pd.DataFrame(results)
+    result_df.rename(columns={"WaitStatus": "WaitWeeks"}, inplace=True)
     result_df.to_csv("libby_search_results.csv", index=False)
     print("\n✅ Search complete! Results exported to libby_search_results.csv")
     return result_df
